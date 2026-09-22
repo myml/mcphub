@@ -4,6 +4,7 @@ import { initializeDatabaseMode } from './utils/migration.js';
 import { createFetchWithProxy, getProxyConfigFromEnv } from './services/proxy.js';
 import { isRetryableDbError } from './utils/dbRetry.js';
 import { hydrateSystemConfigCache, getCachedSystemConfig } from './utils/systemConfigCache.js';
+import { ALLOWED_INTERNAL_HOSTS_ENV_VAR, getAllowedInternalHosts } from './utils/ssrf.js';
 import { logger } from './utils/logger.js';
 import {
   startHostedEventSubscriber,
@@ -189,6 +190,17 @@ async function boot() {
         '⚠️  SECURITY WARNING: routing.skipAuth is ENABLED — dashboard authentication is DISABLED and ALL API callers are treated as admins.\n' +
           '⚠️  Anyone who can reach this port can read/modify settings, export secrets, and register stdio servers (remote code execution).\n' +
           '⚠️  Never expose this instance to a network. To disable: set systemConfig.routing.skipAuth=false in mcp_settings.json.',
+      );
+    }
+
+    // The internal-egress allowlist intentionally relaxes the SSRF blocklist for
+    // named intranet hosts; surface it at startup so an unexpected entry cannot
+    // silently widen egress.
+    const allowedInternalHosts = getAllowedInternalHosts();
+    if (allowedInternalHosts.length > 0) {
+      logger.warn(
+        `Internal-network egress allowlist is active (${ALLOWED_INTERNAL_HOSTS_ENV_VAR}): ` +
+          `${allowedInternalHosts.join(', ')}. These hosts may resolve to loopback/RFC1918/link-local addresses.`,
       );
     }
 

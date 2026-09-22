@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { OpenAPIClient } from '../openapi.js';
 import type { ServerConfig } from '../../types/index.js';
-import { UnsafeUrlError } from '../../utils/ssrf.js';
+import { UnsafeUrlError, ALLOWED_INTERNAL_HOSTS_ENV_VAR } from '../../utils/ssrf.js';
 
 // Shared mock so per-tests can toggle admin status. getUserDao() returns a new
 // object each call but always the same findByUsername reference.
@@ -81,6 +81,7 @@ beforeEach(() => {
 
 afterEach(() => {
   (globalThis as { fetch: unknown }).fetch = originalFetch;
+  delete process.env[ALLOWED_INTERNAL_HOSTS_ENV_VAR];
 });
 
 describe('OpenAPIClient - authenticated spec document fetch (#1044)', () => {
@@ -197,6 +198,37 @@ describe('OpenAPIClient - authenticated spec document fetch (#1044)', () => {
   });
 
   it('blocks an internal spec URL for non-admin owners (SSRF)', async () => {
+    const config: ServerConfig = {
+      type: 'openapi',
+      owner: 'regular',
+      openapi: { url: INTERNAL_SPEC_URL },
+    };
+    const client = new OpenAPIClient(config) as TestClient;
+    const getMock = jest.fn();
+    (client.httpClient as unknown as { get: jest.Mock }).get = getMock;
+
+    await expect(client.initialize()).rejects.toThrow(UnsafeUrlError);
+    expect(getMock).not.toHaveBeenCalled();
+  });
+
+  it('allows an internal spec URL for a non-admin owner when the host is allowlisted', async () => {
+    process.env[ALLOWED_INTERNAL_HOSTS_ENV_VAR] = '127.0.0.1';
+    const config: ServerConfig = {
+      type: 'openapi',
+      owner: 'regular',
+      openapi: { url: INTERNAL_SPEC_URL },
+    };
+    const client = new OpenAPIClient(config) as TestClient;
+    const captured = { v: null as unknown };
+    installCapturingAdapter(client, minimalSpec, captured);
+
+    await client.initialize();
+
+    expect(client.getTools().some((t) => t.name === 'get_things')).toBe(true);
+  });
+
+  it('still blocks an internal spec URL when the allowlist does not match', async () => {
+    process.env[ALLOWED_INTERNAL_HOSTS_ENV_VAR] = '*.corp.example';
     const config: ServerConfig = {
       type: 'openapi',
       owner: 'regular',

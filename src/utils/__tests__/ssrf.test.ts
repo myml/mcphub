@@ -1,9 +1,12 @@
-import { describe, expect, it, jest } from '@jest/globals';
+import { afterEach, describe, expect, it, jest } from '@jest/globals';
 
 import {
+  ALLOWED_INTERNAL_HOSTS_ENV_VAR,
   assertSafeUrl,
   createRedirectValidatingFetch,
+  isAllowedInternalHost,
   isBlockedIp,
+  parseAllowedInternalHosts,
   UnsafeUrlError,
 } from '../ssrf.js';
 
@@ -154,6 +157,165 @@ describe('assertSafeUrl with allowInternal', () => {
   });
 });
 
+describe('MCPHUB_ALLOWED_INTERNAL_HOSTS parsing', () => {
+  it('splits, trims, lower-cases and de-duplicates entries', () => {
+    expect(
+      parseAllowedInternalHosts(' Mirrord.CICD2.getdeepin.org , internal.example ,, MIRRORD.cicd2.getdeepin.org. '),
+    ).toEqual(['mirrord.cicd2.getdeepin.org', 'internal.example']);
+  });
+
+  it('keeps wildcards intact and tolerates URLs, ports and paths', () => {
+    expect(
+      parseAllowedInternalHosts(
+        'https://*.corp.example:8443/api, mirrord-*.corp.example, 10.20.*.*, http://[fd00::1]:8080',
+      ),
+    ).toEqual(['*.corp.example', 'mirrord-*.corp.example', '10.20.*.*', 'fd00::1']);
+  });
+
+  it('returns an empty list for unset/empty/blank input', () => {
+    expect(parseAllowedInternalHosts(undefined)).toEqual([]);
+    expect(parseAllowedInternalHosts('')).toEqual([]);
+    expect(parseAllowedInternalHosts(' , , ')).toEqual([]);
+  });
+
+  it('drops wildcard-only entries that would allowlist every host', () => {
+    expect(parseAllowedInternalHosts('*, *.*, **, internal.example')).toEqual(['internal.example']);
+  });
+});
+
+describe('isAllowedInternalHost', () => {
+  it('matches an exact host case-insensitively and ignores a trailing dot', () => {
+    expect(isAllowedInternalHost('Internal.Example', ['internal.example'])).toBe(true);
+    expect(isAllowedInternalHost('internal.example.', ['internal.example'])).toBe(true);
+  });
+
+  it('supports a leading * wildcard for sub-domains without matching the apex', () => {
+    const allowlist = parseAllowedInternalHosts('*.corp.example');
+
+    expect(isAllowedInternalHost('a.corp.example', allowlist)).toBe(true);
+    expect(isAllowedInternalHost('a.b.corp.example', allowlist)).toBe(true);
+    expect(isAllowedInternalHost('corp.example', allowlist)).toBe(false);
+  });
+
+  it('anchors patterns so a wildcard cannot escape its own domain', () => {
+    const allowlist = parseAllowedInternalHosts('*.corp.example');
+
+    expect(isAllowedInternalHost('evilcorp.example', allowlist)).toBe(false);
+    expect(isAllowedInternalHost('corp.example.evil.net', allowlist)).toBe(false);
+    expect(isAllowedInternalHost('notcorp.example', allowlist)).toBe(false);
+  });
+
+  it('supports * in the middle of a pattern', () => {
+    const allowlist = parseAllowedInternalHosts('mirrord-*.corp.example');
+
+    expect(isAllowedInternalHost('mirrord-1.corp.example', allowlist)).toBe(true);
+    expect(isAllowedInternalHost('mirrord-abc-2.corp.example', allowlist)).toBe(true);
+    expect(isAllowedInternalHost('mirrord.corp.example', allowlist)).toBe(false);
+  });
+
+  it('supports * across labels and in IP-shaped patterns', () => {
+    expect(isAllowedInternalHost('a.b.corp.example', parseAllowedInternalHosts('a.*.example'))).toBe(
+      true,
+    );
+    expect(isAllowedInternalHost('10.20.64.64', parseAllowedInternalHosts('10.20.*.*'))).toBe(true);
+    expect(isAllowedInternalHost('10.21.64.64', parseAllowedInternalHosts('10.20.*.*'))).toBe(false);
+  });
+
+  it('matches bracketed IPv6 hostnames', () => {
+    expect(isAllowedInternalHost('[fd00::1]', parseAllowedInternalHosts('fd00::1'))).toBe(true);
+  });
+
+  it('treats regex metacharacters as literals', () => {
+    const allowlist = parseAllowedInternalHosts('a+b.example');
+
+    expect(isAllowedInternalHost('a+b.example', allowlist)).toBe(true);
+    expect(isAllowedInternalHost('aab.example', allowlist)).toBe(false);
+  });
+
+  it('never allows anything with an empty allowlist', () => {
+    expect(isAllowedInternalHost('internal.example', [])).toBe(false);
+  });
+});
+
+describe('assertSafeUrl with the internal-host allowlist', () => {
+  afterEach(() => {
+    delete process.env[ALLOWED_INTERNAL_HOSTS_ENV_VAR];
+  });
+
+  it('allows an allowlisted hostname that resolves to a private IP', async () => {
+    await expect(
+      assertSafeUrl('http://mirrord.cicd2.getdeepin.org/mcp', {
+        allowedInternalHosts: parseAllowedInternalHosts('*.getdeepin.org'),
+        lookup: lookup({ 'mirrord.cicd2.getdeepin.org': ['10.20.64.64'] }),
+      }),
+    ).resolves.toBe('http://mirrord.cicd2.getdeepin.org/mcp');
+  });
+
+  it('allows an allowlisted IP literal', async () => {
+    await expect(
+      assertSafeUrl('http://10.20.64.64:8080/mcp', {
+        allowedInternalHosts: parseAllowedInternalHosts('10.20.*.*'),
+      }),
+    ).resolves.toBe('http://10.20.64.64:8080/mcp');
+  });
+
+  it('still rejects an internal host outside the allowlist', async () => {
+    await expect(
+      assertSafeUrl('http://other.cicd2.getdeepin.org/mcp', {
+        allowedInternalHosts: parseAllowedInternalHosts('mirrord.cicd2.getdeepin.org'),
+        lookup: lookup({ 'other.cicd2.getdeepin.org': ['10.20.64.65'] }),
+      }),
+    ).rejects.toThrow(UnsafeUrlError);
+  });
+
+  it('still rejects the cloud metadata endpoint', async () => {
+    await expect(
+      assertSafeUrl('http://169.254.169.254/latest/meta-data/', {
+        allowedInternalHosts: parseAllowedInternalHosts('*.getdeepin.org'),
+      }),
+    ).rejects.toThrow(UnsafeUrlError);
+  });
+
+  it('still rejects non-http schemes for an allowlisted host', async () => {
+    await expect(
+      assertSafeUrl('file://mirrord.cicd2.getdeepin.org/etc/passwd', {
+        allowedInternalHosts: parseAllowedInternalHosts('*.getdeepin.org'),
+      }),
+    ).rejects.toThrow(UnsafeUrlError);
+  });
+
+  it('reads the allowlist from the environment by default', async () => {
+    process.env[ALLOWED_INTERNAL_HOSTS_ENV_VAR] = '*.getdeepin.org';
+
+    await expect(
+      assertSafeUrl('http://mirrord.cicd2.getdeepin.org/mcp', {
+        lookup: lookup({ 'mirrord.cicd2.getdeepin.org': ['10.20.64.64'] }),
+      }),
+    ).resolves.toBe('http://mirrord.cicd2.getdeepin.org/mcp');
+  });
+
+  it('lets a caller override the environment allowlist with an explicit list', async () => {
+    process.env[ALLOWED_INTERNAL_HOSTS_ENV_VAR] = '*.getdeepin.org';
+
+    await expect(
+      assertSafeUrl('http://mirrord.cicd2.getdeepin.org/mcp', {
+        allowedInternalHosts: [],
+        lookup: lookup({ 'mirrord.cicd2.getdeepin.org': ['10.20.64.64'] }),
+      }),
+    ).rejects.toThrow(UnsafeUrlError);
+  });
+
+  it('still allows a public host that is not in the allowlist', async () => {
+    process.env[ALLOWED_INTERNAL_HOSTS_ENV_VAR] = 'mirrord.cicd2.getdeepin.org';
+
+    await expect(
+      assertSafeUrl('http://public.example/mcp', {
+        lookup: lookup({ 'public.example': ['93.184.216.34'] }),
+      }),
+    ).resolves.toBe('http://public.example/mcp');
+  });
+});
+
 describe('createRedirectValidatingFetch', () => {
   const makeResponse = (status: number, location?: string, body: BodyInit = ''): Response => {
     const headers = new Headers();
@@ -278,5 +440,38 @@ describe('createRedirectValidatingFetch', () => {
     const res = await safeFetch('http://8.8.8.8/start');
     expect(res.status).toBe(304);
     expect(baseFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('follows a redirect to an allowlisted internal host', async () => {
+    process.env[ALLOWED_INTERNAL_HOSTS_ENV_VAR] = '*.getdeepin.org';
+    const baseFetch = jest
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        makeResponse(302, 'http://mirrord.cicd2.getdeepin.org/mcp') as Response,
+      )
+      .mockResolvedValueOnce(makeResponse(200, undefined, 'internal') as Response);
+    const safeFetch = createRedirectValidatingFetch(baseFetch, false);
+
+    const res = await safeFetch('http://8.8.8.8/start');
+
+    expect(res.status).toBe(200);
+    expect(baseFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a redirect to an internal host outside the allowlist', async () => {
+    process.env[ALLOWED_INTERNAL_HOSTS_ENV_VAR] = 'mirrord.cicd2.getdeepin.org';
+    const baseFetch = jest
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        makeResponse(302, 'http://other.cicd2.getdeepin.org/mcp') as Response,
+      );
+    const safeFetch = createRedirectValidatingFetch(baseFetch, false, async () => ['10.20.64.65']);
+
+    await expect(safeFetch('http://8.8.8.8/start')).rejects.toThrow(UnsafeUrlError);
+    expect(baseFetch).toHaveBeenCalledTimes(1);
+  });
+
+  afterEach(() => {
+    delete process.env[ALLOWED_INTERNAL_HOSTS_ENV_VAR];
   });
 });

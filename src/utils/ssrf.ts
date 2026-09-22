@@ -10,11 +10,117 @@ export class UnsafeUrlError extends Error {
 
 export type SsrfLookup = (host: string) => Promise<string[]>;
 
+// Operator-managed hostname allowlist whose entries may resolve to otherwise
+// blocked internal addresses (loopback / RFC1918 / link-local). It exists so a
+// deployment whose upstream MCP servers legitimately live on an intranet behind
+// a private DNS zone can name those hosts explicitly, instead of granting every
+// non-admin user blanket internal-network egress. Comma-separated; `*` is a
+// wildcard matching any characters, so `*.corp.example` allows sub-domains
+// (`a.corp.example`, `a.b.corp.example`) but not the apex, and
+// `mirrord-*.corp.example` allows one family of hosts. Entries are matched on
+// host name only — scheme, port and path are ignored.
+export const ALLOWED_INTERNAL_HOSTS_ENV_VAR = 'MCPHUB_ALLOWED_INTERNAL_HOSTS';
+
+// Normalize an allowlist entry or a URL hostname into a comparable host:
+// lower-case, without scheme, credentials, path, port, brackets or trailing dot.
+// `*` characters are preserved so patterns survive normalization intact.
+const normalizeHost = (entry: string): string => {
+  let value = entry.trim().toLowerCase();
+  if (!value) {
+    return '';
+  }
+
+  const schemeIndex = value.indexOf('://');
+  if (schemeIndex !== -1) {
+    value = value.slice(schemeIndex + 3);
+  }
+
+  const credentialsIndex = value.indexOf('@');
+  if (credentialsIndex !== -1) {
+    value = value.slice(credentialsIndex + 1);
+  }
+
+  value = value.split(/[/?#]/)[0];
+
+  if (value.startsWith('[')) {
+    const closingBracket = value.indexOf(']');
+    value = closingBracket === -1 ? value.slice(1) : value.slice(1, closingBracket);
+  } else if (value.indexOf(':') === value.lastIndexOf(':')) {
+    // Exactly one colon means host:port; a bare IPv6 literal has several and is
+    // left intact.
+    const portIndex = value.indexOf(':');
+    if (portIndex !== -1) {
+      value = value.slice(0, portIndex);
+    }
+  }
+
+  return value.replace(/\.+$/, '');
+};
+
+// Compiled allowlist patterns, keyed by normalized pattern. Bounded so an
+// arbitrary explicit allowlist cannot grow the cache without limit.
+const hostPatternCache = new Map<string, RegExp>();
+const HOST_PATTERN_CACHE_LIMIT = 200;
+
+const hostPatternToRegExp = (pattern: string): RegExp => {
+  const cached = hostPatternCache.get(pattern);
+  if (cached) {
+    return cached;
+  }
+
+  // `*` matches any characters (dots included); every other character is
+  // literal, so a pattern can never match a host it does not textually cover.
+  const source = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  const compiled = new RegExp(`^${source}$`);
+
+  if (hostPatternCache.size >= HOST_PATTERN_CACHE_LIMIT) {
+    hostPatternCache.clear();
+  }
+  hostPatternCache.set(pattern, compiled);
+  return compiled;
+};
+
+export const parseAllowedInternalHosts = (raw: string | undefined): string[] => {
+  if (!raw) {
+    return [];
+  }
+
+  const hosts = raw
+    .split(',')
+    .map((entry) => normalizeHost(entry))
+    // An entry made only of wildcards (`*`, `**`, `*.*`) would allowlist every
+    // host and silently disable the guard, so it is dropped rather than honored.
+    .filter((entry) => entry.length > 0 && !/^[*.\s]+$/.test(entry));
+
+  return [...new Set(hosts)];
+};
+
+export const getAllowedInternalHosts = (
+  env: NodeJS.ProcessEnv = process.env,
+): string[] => parseAllowedInternalHosts(env[ALLOWED_INTERNAL_HOSTS_ENV_VAR]);
+
+export const isAllowedInternalHost = (host: string, allowlist: readonly string[]): boolean => {
+  if (allowlist.length === 0) {
+    return false;
+  }
+
+  const normalized = normalizeHost(host);
+  if (!normalized) {
+    return false;
+  }
+
+  return allowlist.some((pattern) => hostPatternToRegExp(pattern).test(normalized));
+};
+
 export interface AssertSafeUrlOptions {
   // When true, skip the internal-IP blocklist (loopback / RFC1918 / link-local).
   // Use only for trusted callers (e.g. admin-owned servers) that legitimately
   // need to reach internal services.
   allowInternal?: boolean;
+  // Hostnames that may resolve to blocked internal addresses even when
+  // allowInternal is false. Defaults to the MCPHUB_ALLOWED_INTERNAL_HOSTS
+  // environment allowlist; pass an explicit list (e.g. []) to bypass it.
+  allowedInternalHosts?: readonly string[];
   lookup?: SsrfLookup;
 }
 
@@ -107,7 +213,11 @@ export async function assertSafeUrl(
   rawUrl: string,
   opts: AssertSafeUrlOptions = {},
 ): Promise<string> {
-  const { allowInternal = false, lookup = defaultLookup } = opts;
+  const {
+    allowInternal = false,
+    allowedInternalHosts = getAllowedInternalHosts(),
+    lookup = defaultLookup,
+  } = opts;
 
   let parsed: URL;
   try {
@@ -121,6 +231,14 @@ export async function assertSafeUrl(
   }
 
   if (allowInternal) {
+    return parsed.href;
+  }
+
+  // Operator allowlist (MCPHUB_ALLOWED_INTERNAL_HOSTS): named intranet hosts may
+  // resolve to blocked internal addresses. This lifts ONLY the internal-IP
+  // blocklist — the scheme check above still applies, and a redirect to any host
+  // outside the allowlist is still rejected hop by hop below.
+  if (isAllowedInternalHost(parsed.hostname, allowedInternalHosts)) {
     return parsed.href;
   }
 
@@ -156,7 +274,9 @@ export type FetchLike = (url: string | URL, init?: RequestInit) => Promise<Respo
 // validated against the SSRF blocklist, instead of letting the underlying
 // fetch auto-follow to an attacker-chosen internal address. Validates the
 // resolved Location (absolute or relative) on every hop and caps the chain
-// at maxHops to avoid redirect loops.
+// at maxHops to avoid redirect loops. Each hop also honors the
+// MCPHUB_ALLOWED_INTERNAL_HOSTS allowlist, so a redirect is followed only when
+// its target host is allowlisted (or the caller passed allowInternal).
 export function createRedirectValidatingFetch(
   baseFetch: FetchLike,
   allowInternal: boolean,
