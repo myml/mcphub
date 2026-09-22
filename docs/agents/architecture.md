@@ -36,3 +36,10 @@ Bearer keys have explicit kinds. Legacy and operator-created keys use `kind: 'sy
 - `/:user/mcp/{group|server}` and `/:user/sse/{group}` are user-scoped variants.
 - `AppServer.initialize()` in `src/server.ts` is the route-registration entry point.
 - Authentication spans dashboard JWT/bcrypt, bearer keys, MCPHub's OAuth authorization server, and optional Better Auth. Inspect the current middleware and route code before changing auth behavior.
+
+## Outbound egress (SSRF) policy
+
+- `src/utils/ssrf.ts` owns the guard: `assertSafeUrl()` blocks loopback/RFC1918/CGNAT/link-local/ULA targets, and `createRedirectValidatingFetch()` re-validates every redirect hop.
+- Callers derive `allowInternal` from the **server's** `owner` (`src/services/mcpService.ts`, `src/clients/openapi.ts`, `src/services/upstreamOAuthDisconnectService.ts`), never from the calling user. A non-admin-owned server therefore cannot reach an intranet address, even when shared to a group.
+- `MCPHUB_ALLOWED_INTERNAL_HOSTS` is the operator escape hatch: a comma-separated host allowlist (`*` wildcards) whose entries may resolve to blocked addresses. It is read inside `assertSafeUrl()`, so every call site and redirect hop honors it.
+- OpenAPI local `file:` `$ref` resolution stays admin-only regardless of the allowlist.

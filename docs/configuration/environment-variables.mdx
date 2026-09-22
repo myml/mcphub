@@ -152,6 +152,22 @@ Smart Routing performs vector search over upstream tools to surface only the few
 | `MCPROUTER_REFERER` | Optional `Referer` header sent on MCPRouter requests. |
 | `MCPROUTER_TITLE` | Optional `Title` header sent on MCPRouter requests. |
 
+## Outbound network (SSRF guard)
+
+MCPHub validates every URL it dials for an upstream server — MCP `url`/`streamable-http` transports, OpenAPI document and `$ref` fetches, and upstream OAuth endpoints — against an internal-address blocklist: loopback, RFC1918, CGNAT, link-local (including the cloud metadata endpoint `169.254.169.254`) and their IPv6 equivalents. Servers owned by an admin skip the blocklist; servers owned by a regular user never do, so a normal user cannot add an upstream that points at an intranet address.
+
+Deployments whose upstream servers legitimately live on an intranet can name those hosts explicitly, instead of promoting the user to admin:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MCPHUB_ALLOWED_INTERNAL_HOSTS` | unset | Comma-separated hostname allowlist whose entries may resolve to otherwise blocked internal addresses. `*` matches any characters: `*.corp.example` allows sub-domains (not the apex), `mirrord-*.corp.example` allows one host family, and `10.20.*.*` matches an address range. Entries are matched on host name only — scheme, port and path are ignored. An entry made only of wildcards is ignored, so the guard cannot be disabled by accident. Applies to every user, so keep it as narrow as possible. |
+
+```env
+MCPHUB_ALLOWED_INTERNAL_HOSTS=mirrord.cicd2.getdeepin.org,*.corp.example
+```
+
+Only the internal-IP blocklist is lifted: `http`/`https` is still required, redirects are still validated hop by hop (a redirect to a host outside the allowlist is rejected), and OpenAPI local `file:` references stay admin-only. MCPHub logs a warning at startup listing the active entries.
+
 ## Configuration examples
 
 ### Development
@@ -195,3 +211,4 @@ MCPHub loads variables in this order; later sources override earlier ones:
 2. Always set `JWT_SECRET` explicitly in production.
 3. Rotate bearer keys (`/api/auth/keys`) and OAuth client secrets periodically.
 4. Use Docker / Kubernetes secrets for container deployments instead of plain `-e`.
+5. Keep `MCPHUB_ALLOWED_INTERNAL_HOSTS` as narrow as possible — every entry widens what any user's upstream server may reach.

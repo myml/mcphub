@@ -134,6 +134,22 @@ OIDC_CLIENT_SECRET=your-oidc-client-secret
 | `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | Azure 中的嵌入 deployment 名称。 |
 | `AZURE_OPENAI_EMBEDDING_MODEL` | deployment 背后的实际 OpenAI 模型名称，用于 tokenizer 和 token 上限选择。 |
 
+## 出网访问（SSRF 防护）
+
+MCPHub 会对所有需要主动请求的上游地址做内网地址校验：MCP 的 `url`/`streamable-http` 传输、OpenAPI 文档与 `$ref` 抓取、上游 OAuth 端点。被拦截的地址包括回环、RFC1918、CGNAT、链路本地（含云元数据地址 `169.254.169.254`）及其 IPv6 等价形式。**admin 拥有的服务器跳过该校验，普通用户拥有的服务器永远不会跳过**，因此普通用户无法添加指向内网地址的上游。
+
+如果上游服务确实部署在内网，可以用白名单显式列出这些域名，而不必把用户提升为 admin：
+
+| 变量 | 默认值 | 描述 |
+| --- | --- | --- |
+| `MCPHUB_ALLOWED_INTERNAL_HOSTS` | 未设置 | 逗号分隔的域名白名单，名单内的主机允许解析到被拦截的内网地址。`*` 匹配任意字符：`*.corp.example` 匹配子域名（不含裸域名），`mirrord-*.corp.example` 匹配同一族主机，`10.20.*.*` 可匹配地址段。仅按主机名匹配，协议、端口和路径都会被忽略。仅由通配符组成的条目会被忽略，避免误操作直接关闭防护。该白名单对所有用户生效，请尽量收窄。 |
+
+```env
+MCPHUB_ALLOWED_INTERNAL_HOSTS=mirrord.cicd2.getdeepin.org,*.corp.example
+```
+
+注意：白名单只解除"内网 IP"这一层限制——仍然必须是 `http`/`https`，重定向仍会逐跳校验（跳转到白名单之外的主机依然被拒绝），OpenAPI 的本地 `file:` 引用仍仅限 admin。启动时 MCPHub 会以 warning 日志列出当前生效的白名单条目。
+
 ## 配置示例
 
 ### 开发环境
@@ -195,3 +211,4 @@ API_ENDPOINT=${BASE_URL}/v1
 4. **使用特定于环境的文件**
 5. **在启动时验证所有环境变量**
 6. **为容器部署使用 Docker 密钥**
+7. **尽量收窄 `MCPHUB_ALLOWED_INTERNAL_HOSTS`**：每一条白名单都会放宽任意用户上游服务器可访问的范围
